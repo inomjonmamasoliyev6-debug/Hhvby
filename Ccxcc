@@ -1,0 +1,562 @@
+import telebot
+import urllib.parse
+import random
+import time
+import requests
+from io import BytesIO
+from telebot import types
+
+BOT_TOKEN = "8998017502:AAG1GvbCbNZOIsr1ua5YkXYGml-FcLXJvBY"
+ADMIN_ID = 8057184376
+BOT_USERNAME = None  # birinchi ishga tushganda avtomatik aniqlanadi (referal link uchun)
+
+bot = telebot.TeleBot(BOT_TOKEN)
+
+# ==================== MA'LUMOTLAR BAZASI (xotirada) ====================
+users_list = set()
+banned_users = set()
+user_limits = {}          # ishlatilgan miqdor
+custom_limits = {}        # VIP / bonus bilan oshirilgan limit
+promo_codes = {"VIP2026": 10, "BONUS5": 5}
+used_promo_by_user = {}   # {user_id: set(kodlar)}  -> bitta kod har userga faqat 1 marta
+total_logos_generated = 0
+FREE_LIMIT = 5
+BOT_ACTIVE = True
+
+temp_data = {}             # {user_id: {"name":..,"style":..}}
+admin_states = {}          # admin uchun kutilayotgan amal
+user_states = {}           # oddiy foydalanuvchi uchun kutilayotgan amal (masalan promo-kod)
+last_request_time = {}     # cooldown uchun
+last_generation = {}       # {user_id: {"name":..,"style":..,"width":..,"height":..}} -> qayta yaratish uchun
+history = {}               # {user_id: [ {name, style, time}, ... ]}
+referred_users = set()     # kim allaqachon referal bonus olgan (yangi user sifatida)
+
+COOLDOWN_SECONDS = 6
+IMAGES_PER_REQUEST = 2      # 4 o'rniga 2 ta barqaror va sifatli rasm
+
+STYLE_NAMES = {
+    "minimalist": "Minimalist",
+    "3d": "3D Zamonaviy",
+    "cyberpunk": "Kiberpank",
+    "vintage": "Retro / Vintaj",
+    "neon": "Neon Glow",
+    "luxury": "Luxury Gold",
+    "esports": "Esports / Gaming",
+    "vector": "Gradient Vector",
+}
+
+STYLE_PROMPTS = {
+    "minimalist": "Professional minimalist vector logo featuring typography text '{name}', clean solid background, corporate branding",
+    "3d": "High quality 3D glossy render logo with clear bold text '{name}', studio lighting, octane render",
+    "cyberpunk": "Cyberpunk neon glowing logo design with futuristic typography '{name}', dark sci-fi background",
+    "vintage": "Classic vintage retro hipster logo with elegant typography '{name}', distressed texture",
+    "neon": "Bright glowing neon sign logo style with clear letters '{name}', dark brick wall background",
+    "luxury": "Luxury golden metallic emblem logo with text '{name}', elegant premium style, black background",
+    "esports": "Fierce esports gaming team logo featuring mascot and bold sharp text '{name}', dynamic vector",
+    "vector": "Clean flat vector graphic logo design with precise typography '{name}', modern UI style",
+}
+
+VARIANT_HINTS = [
+    "primary concept, centered composition",
+    "alternative concept, different layout, unique interpretation",
+]
+
+# ==================== KLAVIATURALAR ====================
+def get_main_reply_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        types.KeyboardButton("🎨 Logo Yaratish"),
+        types.KeyboardButton("👤 Profil va Limitlar"),
+        types.KeyboardButton("💎 VIP Sotib olish"),
+        types.KeyboardButton("🎁 Promo-kod kiritish"),
+        types.KeyboardButton("📜 Mening tarixim"),
+        types.KeyboardButton("👥 Do'st taklif qilish"),
+        types.KeyboardButton("🛠 Yordam"),
+    )
+    return markup
+
+
+def get_admin_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("📊 Statistika", callback_data="admin_stats"),
+        types.InlineKeyboardButton("📢 Ommaviy Xabar", callback_data="admin_broadcast"),
+        types.InlineKeyboardButton("💎 Userga VIP berish", callback_data="admin_add_vip"),
+        types.InlineKeyboardButton("⚙️ Tekin limitni o'zgartirish", callback_data="admin_change_limit"),
+        types.InlineKeyboardButton("🎁 Promo-kod qo'shish", callback_data="admin_add_promo"),
+        types.InlineKeyboardButton("🚫 Userni bloklash/blokdan chiqarish", callback_data="admin_ban_user"),
+        types.InlineKeyboardButton("🔒 Botni Yoqish/O'chirish", callback_data="admin_toggle_bot"),
+    )
+    return markup
+
+
+def get_style_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🎨 Minimalist", callback_data="style_minimalist"),
+        types.InlineKeyboardButton("🧊 3D Zamonaviy", callback_data="style_3d"),
+        types.InlineKeyboardButton("🚀 Kiberpank", callback_data="style_cyberpunk"),
+        types.InlineKeyboardButton("📜 Retro / Vintaj", callback_data="style_vintage"),
+        types.InlineKeyboardButton("⚡ Neon Glow", callback_data="style_neon"),
+        types.InlineKeyboardButton("💎 Luxury Gold", callback_data="style_luxury"),
+        types.InlineKeyboardButton("🛡️ Esports / Gaming", callback_data="style_esports"),
+        types.InlineKeyboardButton("📐 Gradient Vector", callback_data="style_vector"),
+    )
+    return markup
+
+
+def get_ratio_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🟦 Kvadrat (1:1)", callback_data="ratio_1"),
+        types.InlineKeyboardButton("🖼 Keng (16:9)", callback_data="ratio_16"),
+    )
+    return markup
+
+
+def get_result_keyboard():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("🔄 Qayta yaratish (yangi variant)", callback_data="regen"))
+    return markup
+
+
+# ==================== YORDAMCHI FUNKSIYALAR ====================
+def is_banned(user_id):
+    return user_id in banned_users and user_id != ADMIN_ID
+
+
+def check_cooldown(user_id):
+    """True qaytarsa - band, kutish kerak."""
+    now = time.time()
+    last = last_request_time.get(user_id, 0)
+    if now - last < COOLDOWN_SECONDS:
+        return True
+    last_request_time[user_id] = now
+    return False
+
+
+def has_limit(user_id):
+    if user_id == ADMIN_ID:
+        return True
+    max_allowed = custom_limits.get(user_id, FREE_LIMIT)
+    used = user_limits.get(user_id, 0)
+    return used < max_allowed
+
+
+def download_image(url, timeout=20):
+    """Rasmni avval serverga yuklab olamiz, shunda Telegram xatolik bermaydi."""
+    resp = requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    if len(resp.content) < 500:  # juda kichik javob = xato
+        raise ValueError("bo'sh yoki noto'g'ri rasm javobi")
+    bio = BytesIO(resp.content)
+    bio.name = "logo.png"
+    return bio
+
+
+def generate_and_send_logos(chat_id, user_id, name, style, width, height):
+    """Bir nechta logo variantini yuklab, muvaffaqiyatli bo'lganlarini yuboradi."""
+    global total_logos_generated
+
+    base_template = STYLE_PROMPTS.get(style, STYLE_PROMPTS["minimalist"])
+    sent_count = 0
+
+    for i in range(IMAGES_PER_REQUEST):
+        hint = VARIANT_HINTS[i % len(VARIANT_HINTS)]
+        prompt = f"{base_template.format(name=name)}, {hint}, sharp details, highly detailed graphic design."
+        safe_prompt = urllib.parse.quote(prompt)
+        seed = random.randint(10000, 999999)
+        url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width={width}&height={height}&nologo=true&seed={seed}"
+
+        # har bir rasmga 2 marta urinib ko'ramiz (birinchi urinish muvaffaqiyatsiz bo'lsa)
+        photo_bytes = None
+        for attempt in range(2):
+            try:
+                photo_bytes = download_image(url)
+                break
+            except Exception:
+                time.sleep(1.5)
+                continue
+
+        if photo_bytes is None:
+            continue
+
+        try:
+            bot.send_photo(chat_id, photo_bytes)
+            sent_count += 1
+            total_logos_generated += 1
+        except Exception:
+            continue
+
+    return sent_count
+
+
+# ==================== START ====================
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    global BOT_USERNAME
+    user_id = message.from_user.id
+
+    if BOT_USERNAME is None:
+        try:
+            BOT_USERNAME = bot.get_me().username
+        except Exception:
+            BOT_USERNAME = ""
+
+    is_new_user = user_id not in users_list
+    users_list.add(user_id)
+
+    if is_banned(user_id):
+        bot.send_message(message.chat.id, "🚫 Siz botdan foydalanishdan bloklangansiz.")
+        return
+
+    if not BOT_ACTIVE and user_id != ADMIN_ID:
+        bot.send_message(message.chat.id, "🛠 <b>Botda texnik profilaktika ketmoqda.</b>", parse_mode="HTML")
+        return
+
+    # Referal tizimi: /start ref_12345
+    parts = message.text.split()
+    if is_new_user and len(parts) > 1 and parts[1].startswith("ref_"):
+        try:
+            referrer_id = int(parts[1].replace("ref_", ""))
+            if referrer_id != user_id and user_id not in referred_users:
+                referred_users.add(user_id)
+                ref_max = custom_limits.get(referrer_id, FREE_LIMIT)
+                custom_limits[referrer_id] = ref_max + 2
+                try:
+                    bot.send_message(referrer_id, "🎉 Sizning taklifingiz bilan yangi foydalanuvchi qo'shildi! Sizga <b>+2</b> limit berildi.", parse_mode="HTML")
+                except Exception:
+                    pass
+        except ValueError:
+            pass
+
+    bot.send_message(
+        message.chat.id,
+        "👋 <b>Assalomu alaykum!</b> Premium AI Logo generator botiga xush kelibsiz.\n\n"
+        "Men kompaniyangiz, brendingiz yoki ismingiz uchun mukammal professional logotiplar yaratib beraman. Pastdagi tugmani bosing:",
+        reply_markup=get_main_reply_keyboard(),
+        parse_mode="HTML",
+    )
+
+
+@bot.message_handler(commands=['admin'])
+def admin_panel(message):
+    if message.from_user.id == ADMIN_ID:
+        bot.send_message(message.chat.id, "👑 <b>Boshqaruv Paneli:</b>", reply_markup=get_admin_keyboard(), parse_mode="HTML")
+    else:
+        bot.send_message(message.chat.id, "❌ Bu buyruq faqat admin uchun!")
+
+
+# ==================== ASOSIY MATN HANDLER ====================
+@bot.message_handler(func=lambda message: True)
+def handle_text(message):
+    user_id = message.from_user.id
+    text = message.text.strip()
+
+    if is_banned(user_id):
+        bot.send_message(message.chat.id, "🚫 Siz botdan foydalanishdan bloklangansiz.")
+        return
+
+    # ---- Admin holatlari ----
+    if user_id == ADMIN_ID and user_id in admin_states:
+        state = admin_states.pop(user_id)
+        if state == "broadcast":
+            count = 0
+            for uid in users_list:
+                try:
+                    bot.send_message(uid, text)
+                    count += 1
+                except Exception:
+                    pass
+            bot.send_message(message.chat.id, f"✅ Xabar <b>{count}</b> ta foydalanuvchiga yuborildi!", parse_mode="HTML")
+            return
+        elif state == "add_vip":
+            try:
+                target_id = int(text)
+                custom_limits[target_id] = 1000
+                bot.send_message(message.chat.id, f"🎉 Foydalanuvchi <code>{target_id}</code> ga VIP berildi!", parse_mode="HTML")
+            except ValueError:
+                bot.send_message(message.chat.id, "❌ Noto'g'ri ID.")
+            return
+        elif state == "change_limit":
+            global FREE_LIMIT
+            try:
+                FREE_LIMIT = int(text)
+                bot.send_message(message.chat.id, f"✅ Yangi standart limit: <b>{FREE_LIMIT}</b>", parse_mode="HTML")
+            except ValueError:
+                bot.send_message(message.chat.id, "❌ Noto'g'ri son.")
+            return
+        elif state == "add_promo":
+            parts = text.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                code, val = parts[0].upper(), int(parts[1])
+                promo_codes[code] = val
+                bot.send_message(message.chat.id, f"✅ <code>{code}</code> promo-kodi qo'shildi (+{val} limit).", parse_mode="HTML")
+            else:
+                bot.send_message(message.chat.id, "❌ Format xato! Masalan: <code>NEW2026 5</code>", parse_mode="HTML")
+            return
+        elif state == "ban_user":
+            try:
+                target_id = int(text)
+                if target_id in banned_users:
+                    banned_users.discard(target_id)
+                    bot.send_message(message.chat.id, f"✅ <code>{target_id}</code> blokdan chiqarildi.", parse_mode="HTML")
+                else:
+                    banned_users.add(target_id)
+                    bot.send_message(message.chat.id, f"🚫 <code>{target_id}</code> bloklandi.", parse_mode="HTML")
+            except ValueError:
+                bot.send_message(message.chat.id, "❌ Noto'g'ri ID.")
+            return
+
+    # ---- Foydalanuvchi kutilayotgan holatlari (promo-kod) ----
+    if user_id in user_states and user_states[user_id] == "awaiting_promo":
+        user_states.pop(user_id, None)
+        code = text.upper()
+        already_used = used_promo_by_user.get(user_id, set())
+
+        if code in already_used:
+            bot.send_message(message.chat.id, "⚠️ Siz bu promo-koddan avval foydalangansiz.", reply_markup=get_main_reply_keyboard())
+        elif code in promo_codes:
+            bonus = promo_codes[code]
+            current_max = custom_limits.get(user_id, FREE_LIMIT)
+            custom_limits[user_id] = current_max + bonus
+            used_promo_by_user.setdefault(user_id, set()).add(code)
+            bot.send_message(message.chat.id, f"🎉 Tabriklaymiz! Sizga <b>+{bonus}</b> ta qo'shimcha limit berildi!", parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+        else:
+            bot.send_message(message.chat.id, "❌ Bunday promo-kod topilmadi. Qaytadan urinib ko'rishingiz mumkin: \"🎁 Promo-kod kiritish\" tugmasi orqali.", reply_markup=get_main_reply_keyboard())
+        return
+
+    # ---- Reply tugmalar ----
+    if text == "🎨 Logo Yaratish":
+        user_states.pop(user_id, None)
+        bot.send_message(message.chat.id, "✍️ Iltimos, logotipingiz uchun <b>kompaniya yoki ismingizni</b> yuboring:", parse_mode="HTML")
+        return
+
+    elif text == "👤 Profil va Limitlar":
+        max_l = custom_limits.get(user_id, FREE_LIMIT)
+        used_l = user_limits.get(user_id, 0)
+        status = "VIP 💎" if user_id in custom_limits else "Standard 👤"
+        bot.send_message(
+            message.chat.id,
+            f"👤 <b>Sizning profilingiz:</b>\n\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"⭐ Status: <b>{status}</b>\n"
+            f"📊 Ishlatilgan: <b>{used_l} / {max_l}</b>",
+            parse_mode="HTML", reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
+    elif text == "💎 VIP Sotib olish":
+        bot.send_message(
+            message.chat.id,
+            "💎 <b>VIP STATUSNI QO'LGA KIRITING!</b>\n\n"
+            "• Cheksiz logotip yaratish\n"
+            "• Yuqori sifat\n"
+            "• Tezkor generatsiya\n\n"
+            "Narxi: <b>15,000 so'm / oy</b>\n"
+            "Sotib olish uchun admin bilan bog'laning: @Admin_Username",
+            parse_mode="HTML", reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
+    elif text == "🎁 Promo-kod kiritish":
+        user_states[user_id] = "awaiting_promo"
+        bot.send_message(message.chat.id, "🎁 Endi promo-kodni yozib yuboring (Masalan: <code>VIP2026</code>):", parse_mode="HTML")
+        return
+
+    elif text == "📜 Mening tarixim":
+        user_history = history.get(user_id, [])
+        if not user_history:
+            bot.send_message(message.chat.id, "📭 Hozircha hech qanday logo yaratmagansiz.", reply_markup=get_main_reply_keyboard())
+        else:
+            lines = ["📜 <b>So'nggi yaratgan logolaringiz:</b>\n"]
+            for item in reversed(user_history[-5:]):
+                style_name = STYLE_NAMES.get(item["style"], item["style"])
+                lines.append(f"• <b>{item['name']}</b> — {style_name} ({item['time']})")
+            bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+        return
+
+    elif text == "👥 Do'st taklif qilish":
+        username = BOT_USERNAME or "your_bot"
+        link = f"https://t.me/{username}?start=ref_{user_id}"
+        bot.send_message(
+            message.chat.id,
+            f"👥 <b>Do'stlaringizni taklif qiling!</b>\n\n"
+            f"Ushbu havola orqali kirgan har bir yangi foydalanuvchi uchun sizga <b>+2 limit</b> beriladi:\n\n"
+            f"<code>{link}</code>",
+            parse_mode="HTML", reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
+    elif text == "🛠 Yordam":
+        bot.send_message(
+            message.chat.id,
+            "🛠 <b>Yordam markazi:</b>\n\n"
+            "1. 'Logo Yaratish' tugmasini bosing.\n"
+            "2. Kompaniya/ism matnini yuboring.\n"
+            "3. Uslub va o'lchamni tanlang.\n"
+            "4. Natijadan keyin \"🔄 Qayta yaratish\" bilan yangi variant olishingiz mumkin.\n\n"
+            "Savollar bo'lsa adminga yozing.",
+            parse_mode="HTML", reply_markup=get_main_reply_keyboard(),
+        )
+        return
+
+    if not BOT_ACTIVE and user_id != ADMIN_ID:
+        bot.send_message(message.chat.id, "🛠 Botda texnik profilaktika ketmoqda.")
+        return
+
+    # ---- Logo nomi sifatida qabul qilish ----
+    users_list.add(user_id)
+
+    if not has_limit(user_id):
+        bot.send_message(message.chat.id, "🚫 Bepul limitlaringiz tugadi.\n💎 <i>VIP sotib oling yoki promo-kod kiriting.</i>", parse_mode="HTML", reply_markup=get_main_reply_keyboard())
+        return
+
+    if len(text) > 40:
+        bot.send_message(message.chat.id, "⚠️ Nom juda uzun. Iltimos, 40 belgidan qisqaroq nom kiriting.")
+        return
+
+    temp_data[user_id] = {"name": text}
+    bot.send_message(message.chat.id, f"✅ <b>'{text}'</b> nomi qabul qilindi.\nEndi logotip <b>uslubini</b> tanlang:", reply_markup=get_style_keyboard(), parse_mode="HTML")
+
+
+# ==================== CALLBACK (Inline tugmalar) ====================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_listener(call):
+    global BOT_ACTIVE
+    user_id = call.from_user.id
+    data = call.data
+
+    if is_banned(user_id):
+        bot.answer_callback_query(call.id, "🚫 Siz bloklangansiz.", show_alert=True)
+        return
+
+    # ---- ADMIN ----
+    if user_id == ADMIN_ID:
+        if data == "admin_stats":
+            status_text = "Aktiv" if BOT_ACTIVE else "Profilaktikada"
+            text = (f"📊 <b>STATISTIKA:</b>\n\n"
+                    f"👤 Foydalanuvchilar: <b>{len(users_list)} ta</b>\n"
+                    f"🖼 Jami logotiplar: <b>{total_logos_generated} ta</b>\n"
+                    f"🚫 Bloklanganlar: <b>{len(banned_users)} ta</b>\n"
+                    f"⚙️ Standart limit: <b>{FREE_LIMIT} ta</b>\n"
+                    f"🟢 Holati: <b>{status_text}</b>")
+            bot.send_message(call.message.chat.id, text, parse_mode="HTML")
+            return
+        elif data == "admin_broadcast":
+            admin_states[user_id] = "broadcast"
+            bot.send_message(call.message.chat.id, "📢 Hammaga yuboriladigan xabarni kiriting:")
+            return
+        elif data == "admin_add_vip":
+            admin_states[user_id] = "add_vip"
+            bot.send_message(call.message.chat.id, "💎 VIP berish uchun User ID kiriting:")
+            return
+        elif data == "admin_change_limit":
+            admin_states[user_id] = "change_limit"
+            bot.send_message(call.message.chat.id, "⚙️ Yangi standart limit sonini kiriting:")
+            return
+        elif data == "admin_add_promo":
+            admin_states[user_id] = "add_promo"
+            bot.send_message(call.message.chat.id, "🎁 Format: <code>KOD SONI</code> (masalan: <i>START 10</i>):", parse_mode="HTML")  
+        return  
+    elif data == "admin_ban_user":  
+        admin_states[user_id] = "ban_user"  
+        bot.send_message(call.message.chat.id, "🚫 Bloklash/blokdan chiqarish uchun User ID kiriting:")  
+        return  
+    elif data == "admin_toggle_bot":  
+        BOT_ACTIVE = not BOT_ACTIVE  
+        status = "yoqildi" if BOT_ACTIVE else "o'chirildi"  
+        bot.send_message(call.message.chat.id, f"⚙️ Bot <b>{status}</b>!", parse_mode="HTML")  
+        return  
+
+# ---- Uslub tanlash ----  
+if data.startswith("style_"):  
+    style = data.split("_", 1)[1]  
+    if user_id not in temp_data:  
+        bot.answer_callback_query(call.id, "Iltimos, avval logo nomini yuboring.", show_alert=True)  
+        return  
+    temp_data[user_id]["style"] = style  
+    bot.edit_message_text("📐 Logotip formatini (razmerini) tanlang:", call.message.chat.id, call.message.message_id, reply_markup=get_ratio_keyboard())  
+    return  
+
+# ---- Razmer tanlash -> generatsiya ----  
+if data.startswith("ratio_"):  
+    if check_cooldown(user_id) and user_id != ADMIN_ID:  
+        bot.answer_callback_query(call.id, f"⏳ Iltimos {COOLDOWN_SECONDS} soniya kutib, qayta urinib ko'ring.", show_alert=True)  
+        return  
+
+    if not has_limit(user_id):  
+        bot.answer_callback_query(call.id, "🚫 Limitingiz tugagan.", show_alert=True)  
+        return  
+
+    ratio_type = data.split("_", 1)[1]  
+    width, height = (1024, 1024) if ratio_type == "1" else (1280, 720)  
+
+    user_data = temp_data.get(user_id, {"name": "Brand", "style": "minimalist"})  
+    logo_name = user_data["name"]  
+    style = user_data["style"]  
+
+    bot.answer_callback_query(call.id)  
+    bot.edit_message_text(f"⏳ <b>{logo_name}</b> uchun mukammal dizayn(lar) tayyorlanmoqda...\n<i>Iltimos kuting...</i>", call.message.chat.id, call.message.message_id, parse_mode="HTML")  
+
+    sent = generate_and_send_logos(call.message.chat.id, user_id, logo_name, style, width, height)  
+
+    if sent > 0:  
+        user_limits[user_id] = user_limits.get(user_id, 0) + 1  
+        last_generation[user_id] = {"name": logo_name, "style": style, "width": width, "height": height}  
+        history.setdefault(user_id, []).append({  
+            "name": logo_name, "style": style, "time": time.strftime("%d.%m %H:%M"),  
+        })  
+        max_allowed = custom_limits.get(user_id, FREE_LIMIT)  
+        bot.send_message(  
+            call.message.chat.id,  
+            f"✅ Tayyor! ({sent} ta rasm) Sizning urinishingiz: <b>{user_limits[user_id]}/{max_allowed}</b>",  
+            parse_mode="HTML", reply_markup=get_result_keyboard(),  
+        )  
+    else:  
+        bot.send_message(  
+            call.message.chat.id,  
+            "❌ Rasm generatsiya xizmati vaqtincha javob bermayapti. Iltimos, 1 daqiqadan so'ng qayta urinib ko'ring.",  
+            reply_markup=get_main_reply_keyboard(),  
+        )  
+    return  
+
+# ---- Qayta yaratish ----  
+if data == "regen":  
+    if check_cooldown(user_id) and user_id != ADMIN_ID:  
+        bot.answer_callback_query(call.id, f"⏳ Iltimos {COOLDOWN_SECONDS} soniya kutib qayta urinib ko'ring.", show_alert=True)  
+        return  
+    if not has_limit(user_id):  
+        bot.answer_callback_query(call.id, "🚫 Limitingiz tugagan.", show_alert=True)  
+        return  
+    if user_id not in last_generation:  
+        bot.answer_callback_query(call.id, "Avval yangi logo yarating.", show_alert=True)  
+        return  
+
+    bot.answer_callback_query(call.id)  
+    params = last_generation[user_id]  
+    bot.send_message(call.message.chat.id, f"⏳ <b>{params['name']}</b> uchun yangi variant tayyorlanmoqda...", parse_mode="HTML")  
+
+    sent = generate_and_send_logos(call.message.chat.id, user_id, params["name"], params["style"], params["width"], params["height"])  
+
+    if sent > 0:  
+        user_limits[user_id] = user_limits.get(user_id, 0) + 1  
+        max_allowed = custom_limits.get(user_id, FREE_LIMIT)  
+        bot.send_message(  
+            call.message.chat.id,  
+            f"✅ Tayyor! ({sent} ta rasm) Sizning urinishingiz: <b>{user_limits[user_id]}/{max_allowed}</b>",  
+            parse_mode="HTML", reply_markup=get_result_keyboard(),  
+        )  
+    else:  
+        bot.send_message(call.message.chat.id, "❌ Rasm generatsiya xizmati vaqtincha javob bermayapti. Birozdan so'ng qayta urinib ko'ring.", reply_markup=get_main_reply_keyboard())  
+    return
+
+==================== Bot komandalar menyusi ====================
+
+bot.set_my_commands([
+types.BotCommand("start", "🤖 Qayta ishga tushirish"),
+types.BotCommand("admin", "👑 Admin Panel"),
+])
+
+print("🚀 Mukammal Logo Bot ishga tushdi va tayyor!")
+bot.infinity_polling()
