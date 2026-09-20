@@ -61,7 +61,7 @@ from telegram.request import HTTPXRequest
 # ========================================================
 
 # DIQQAT: tokenni kodda emas, Render > Environment ichida BOT_TOKEN sifatida saqlang!
-TOKEN = os.environ.get("BOT_TOKEN_OVERRIDE") or "8856340901:AAErIjCS_dmoAUVRwtzajyA29_zlc_eNSDA"
+TOKEN = os.environ.get("BOT_TOKEN_OVERRIDE") or "8856340901:AAF64e7WUXPxQBAmzTgWQWcM45Z1oyynCFw"
 SUPER_ADMIN = 8057184376
 ADMIN_PROFILE_ID = 8057184376
 
